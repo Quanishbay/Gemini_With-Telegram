@@ -1,104 +1,217 @@
+import logging
+import os
+import requests
+import json
+import re
+from openai import OpenAI
+from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ChatAction
-import logging
-import os
-from dotenv import load_dotenv
-import requests
-import json
 
-# --- Загрузка переменных окружения и настройки (как в вашем коде) ---
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-MODEL_NAME = "gemini-1.5-flash-latest"
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+CLIENT_API_URL = os.getenv('CLIENT_API_URL', "http://localhost:8000/api/create-client")
+API_BASE_URL = os.getenv('API_BASE_URL', 'http://localhost:8000')
+API_EMAIL = os.getenv('API_EMAIL')
+API_PASSWORD = os.getenv('API_PASSWORD')
+CAR_WASH_ID = os.getenv('CAR_WASH_ID')
+
+OPENAI_MODEL = "gpt-4"
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+REGISTRATION_KEYWORDS = {
+    "зарегистрироваться", "регистрация", "записаться", "запись на мойку",
+    "новый клиент", "стать клиентом", "оформить карту", "нужна запись",
+}
+
+SERVICE_KEYWORDS = {
+    "услуги", "что моете", "какие услуги", "список услуг", "прайс",
+    "цены", "стоимость", "сколько стоит", "узнать цены",
+}
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-# --- Функция для вызова Gemini API (как в вашем коде) ---
-def get_gemini_response(query: str):
-    if not GEMINI_API_KEY:
-        logger.error("GEMINI_API_KEY не доступен внутри функции get_gemini_response.")
-        return {"error": "API ключ Gemini не настроен."}
-    url = f'https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY}'
-    headers = {'Content-Type': 'application/json'}
-    data = {"contents": [{"parts": [{"text": query}]}]}
-    try:
-        response = requests.post(url, headers=headers, json=data, timeout=60)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        error_message = f"Ошибка при запросе к Gemini API: {e}"
-        try:
-            if e.response is not None:
-                error_details = e.response.json()
-                error_message += f"\nДетали от API: {json.dumps(error_details, indent=2, ensure_ascii=False)}"
-                error_message += f"\nТекст ответа сервера: {e.response.text}"
-        except (ValueError, AttributeError):
-            if hasattr(e, 'response') and e.response is not None:
-                error_message += f"\nТекст ответа сервера: {e.response.text}"
-        logger.error(error_message)
-        return {"error": error_message}
-    except Exception as e:
-        logger.exception(f"Непредвиденная ошибка при запросе к Gemini API: {e}")
-        return {"error": f"Непредвиденная ошибка: {e}"}
-
-# --- Глобальный словарь для хранения контекста диалога ---
 user_context = {}
+api_access_token = None
+cached_services = []
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
+def get_access_token():
+    global api_access_token
+    if api_access_token:
+        return api_access_token
+    try:
+        response = requests.post(f"{API_BASE_URL}/api/auth/login", json={'email': API_EMAIL, 'password': API_PASSWORD}, timeout=10)
+        response.raise_for_status()
+        access_token = response.json().get("access_token")
+        if access_token:
+            api_access_token = access_token
+            return access_token
+        return None
+    except Exception as e:
+        logger.error(f"API auth error: {e}")
+        return None
+
+def get_services_from_api():
+    global cached_services
+    token = get_access_token()
+    if not token:
+        return None
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/api/car-washes/services-by-id",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"id": CAR_WASH_ID},
+            timeout=10
+        )
+        response.raise_for_status()
+        services_data = response.json()
+        if isinstance(services_data, list):
+            cached_services = services_data
+        elif isinstance(services_data, dict) and 'services' in services_data:
+            cached_services = services_data['services']
+        else:
+            cached_services = []
+        return cached_services
+    except Exception as e:
+        logger.error(f"Error fetching services: {e}")
+        cached_services = []
+        return None
+
+def get_services_cached():
+    if not cached_services:
+        return get_services_from_api()
+    return cached_services
+
+def get_openai_response(prompt):
+    try:
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "Ты — вежливый и краткий консультант автомойки 'Чистый Блеск'. Отвечай на вопросы клиента уверенно и по делу. Не задавай встречных вопросов и не перенаправляй к администратору."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=500,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logger.error(f"OpenAI error: {e}")
+        return "Произошла ошибка при обращении к ИИ. Пожалуйста, попробуйте позже."
+
+def validate_and_clean_phone_number(phone):
+    cleaned = re.sub(r'\D', '', phone)
+    return f"+{cleaned}" if phone.strip().startswith('+') and len(cleaned) >= 7 else cleaned if len(cleaned) >= 7 else None
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    user_context[chat_id] = {} # Инициализация контекста для нового пользователя
-    await update.message.reply_html(
-        f"Привет, {user.mention_html()}!\n\nЯ готов помочь вам с выбором услуг автомойки. Задайте свой вопрос."
-    )
+    user_context[chat_id] = {}
+    user_name = update.effective_user.first_name
+    await update.message.reply_text(f"Привет, {user_name}! Я консультант автомойки 'Чистый Блеск'. Напишите, если хотите узнать об услугах или записаться.")
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Просто напишите мне свой вопрос об услугах автомойки.\n\nКоманды:\n/start - Начать диалог\n/help - Показать это сообщение"
-    )
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("/start - начать\n/register - записаться\n/help - помощь")
 
-async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_query = update.message.text
-    user = update.effective_user
+async def register_client_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    user_context[chat_id] = {'step': 'awaiting_name'}
+    await update.message.reply_text("Введите ваше имя:")
 
-    logger.info(f"Сообщение от {user.username} ({user.id}) в чате {chat_id}: '{user_query[:50]}...'")
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    text = update.message.text.strip()
+    step = user_context.get(chat_id, {}).get('step')
 
-    if chat_id not in user_context:
-        user_context[chat_id] = {}
+    if step == 'awaiting_name':
+        user_context[chat_id]['name'] = text
+        user_context[chat_id]['step'] = 'awaiting_phone'
+        await update.message.reply_text("Теперь введите номер телефона:")
+        return
 
-    current_context = user_context[chat_id].get('context', "")
-    prompt = f"Ты - консультант по обслуживанию автомоек. Учитывай предыдущий диалог:\n\n{current_context}\n\nОтветь на следующий вопрос пользователя и, если необходимо, задай уточняющий вопрос, чтобы помочь ему выбрать подходящую услугу:\n\n{user_query}"
+    if step == 'awaiting_phone':
+        phone = validate_and_clean_phone_number(text)
+        if not phone:
+            await update.message.reply_text("Неверный формат номера. Повторите ввод:")
+            return
+        user_context[chat_id]['phone'] = phone
+        services = get_services_cached()
+        user_context[chat_id]['step'] = 'awaiting_service'
+        service_list = '\n'.join([
+            f"{i+1}. {s.get('service_name', 'Без названия')} - {s.get('price', 'цена неизвестна')}"
+            for i, s in enumerate(services)
+        ])
+        await update.message.reply_text(f"Выберите услугу, введя номер из списка:\n{service_list}")
+        return
 
-    response = get_gemini_response(prompt)
-
-    if "error" in response:
-        logger.error(f"Ошибка Gemini API для {user.username}: {response['error']}")
-        await update.message.reply_text("Произошла ошибка. Попробуйте позже.")
-    else:
+    if step == 'awaiting_service':
+        services = get_services_cached()
         try:
-            generated_text = response['candidates'][0]['content']['parts'][0]['text']
-            logger.info(f"Ответ Gemini для {user.username}: '{generated_text[:50]}...'")
-            await update.message.reply_text(generated_text)
-            # Обновляем контекст, добавляя как запрос пользователя, так и ответ бота
-            user_context[chat_id]['context'] = f"{current_context}\nКлиент: {user_query}\nБот: {generated_text}"
+            selected_index = int(text.strip()) - 1
+            if selected_index < 0 or selected_index >= len(services):
+                await update.message.reply_text("Неверный номер. Повторите ввод, выбрав номер из списка.")
+                return
+            service = services[selected_index]
+            service_id = service.get("id")
+            if not service_id:
+                logger.error(f"Ошибка: услуга без ID: {service}")
+                await update.message.reply_text("Ошибка: выбранная услуга не содержит ID. Пожалуйста, выберите другую или попробуйте позже.")
+                return
+            data = {
+                "name": user_context[chat_id]['name'],
+                "phone": user_context[chat_id]['phone'],
+                "service_id": service_id
+            }
+            logger.info(f"Отправка данных на API: {data}")
+            response = requests.post(CLIENT_API_URL, json=data, timeout=10)
+            if response.status_code in [200, 201]:
+                await update.message.reply_text(f"Запись на '{service['service_name']}' прошла успешно!")
+            else:
+                logger.error(f"Ответ от API {response.status_code}: {response.text}")
+                await update.message.reply_text("Ошибка при записи. Попробуйте позже.")
+        except ValueError:
+            await update.message.reply_text("Пожалуйста, введите корректный номер из списка.")
+        except Exception as e:
+            logger.error(f"Ошибка при выборе услуги: {e}")
+            await update.message.reply_text("Произошла ошибка. Повторите ввод номера услуги.")
+        user_context[chat_id] = {}
+        return
 
-        except (KeyError, IndexError, TypeError) as e:
-            logger.error(f"Ошибка разбора ответа Gemini для {user.username}: {e}. Полный ответ: {response}")
-            await update.message.reply_text("Некорректный ответ от Gemini.")
+    if any(k in text.lower() for k in REGISTRATION_KEYWORDS):
+        await register_client_command(update, context)
+        return
 
-def main() -> None:
-    logger.info("Запуск бота...")
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-    logger.info("Бот запущен и готов принимать сообщения.")
-    application.run_polling()
-    logger.info("Бот остановлен.")
+    if any(k in text.lower() for k in SERVICE_KEYWORDS):
+        services = get_services_cached()
+        service_list = '\n'.join([
+            f"{i+1}. {s['service_name']} - {s.get('price', 'цена неизвестна')}"
+            for i, s in enumerate(services)
+        ])
+        await update.message.reply_text(f"Наши услуги:\n{service_list}")
+        return
 
-if __name__ == '__main__':
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    prompt = f"Ты — консультант автомойки. Клиент спрашивает: {text}"
+    reply = get_openai_response(prompt)
+    await update.message.reply_text(reply)
+
+def main():
+    if not TELEGRAM_BOT_TOKEN:
+        logger.critical("TELEGRAM_BOT_TOKEN not set")
+        return
+
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("register", register_client_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+
+    logger.info("Bot is starting...")
+    app.run_polling()
+
+if __name__ == "__main__":
     main()
